@@ -121,7 +121,7 @@ http://127.0.0.1:8000/docs
 
 ## 👩‍💻 Author
 
-**Rishika H.J**
+**Kritika Priya**
 B.Tech CSE (Cybersecurity)
 Frontend & Security Enthusiast
 
