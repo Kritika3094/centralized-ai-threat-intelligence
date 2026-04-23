@@ -1,99 +1,212 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List
+from __future__ import annotations
 
-# ✅ import router (NEW)
-from api.health import router as health_router
+from pathlib import Path
+from typing import Optional
 
-app = FastAPI(title="Centralized AI Threat Intelligence Platform")
+from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
-# ✅ include router (NEW — VERY IMPORTANT)
+from backend.api.health import router as health_router
+from backend.services.analysis import IOC_TYPES, STATUS_OPTIONS
+from backend.services.repository import (
+    add_threat,
+    generate_auto_feed,
+    get_dashboard_context,
+    get_feed_context,
+    get_filtered_threats,
+    get_high_risk_alerts,
+    get_reports_context,
+    get_threat_by_id,
+    initialize_database,
+    update_threat_status,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+app = FastAPI(title="Centralized AI Threat Intelligence Dashboard")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.include_router(health_router)
 
 
-# -------- Root API --------
-@app.get("/")
-def read_root():
-    return {
-        "message": "Centralized AI Threat Intelligence Platform is running"
-    }
+@app.on_event("startup")
+def startup() -> None:
+    initialize_database()
 
 
-# -------- IOC Model --------
-class IOC(BaseModel):
-    ioc_value: str
-    ioc_type: str
-    threat_type: str
-    confidence: str
-
-
-# -------- Temporary storage --------
-ioc_database: List[dict] = []
-
-
-# -------- Threat scoring function --------
-def calculate_threat_score(confidence: str):
-    confidence_map = {
-        "Low": 30,
-        "Medium": 60,
-        "High": 90
-    }
-
-    base_score = confidence_map.get(confidence, 50)
-
-    # simplified scoring formula (MVP)
-    threat_score = (
-        base_score * 0.3 +
-        70 * 0.3 +      # exploit activity (dummy)
-        80 * 0.2 +      # asset criticality (dummy)
-        60 * 0.2        # frequency (dummy)
+@app.get("/", response_class=HTMLResponse)
+def login_page(request: Request, error: Optional[str] = None):
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"request": request, "error": error, "page": "login"},
     )
 
-    return round(threat_score, 2)
+
+@app.post("/login")
+def login(username: str = Form(...), password: str = Form(...)):
+    if username == "admin" and password == "admin123":
+        return RedirectResponse("/dashboard", status_code=302)
+    return RedirectResponse("/?error=Invalid+credentials", status_code=302)
 
 
-# -------- Upload IOC API --------
-@app.post("/upload-ioc")
-def upload_ioc(ioc: IOC):
-    score = calculate_threat_score(ioc.confidence)
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(
+    request: Request,
+    search: str = Query("", alias="search"),
+    ioc_type: str = Query("All", alias="type"),
+    risk: str = Query("All"),
+    status: str = Query("All"),
+):
+    context = get_dashboard_context(
+        search=search,
+        ioc_type=ioc_type,
+        risk=risk,
+        status=status,
+    )
+    context.update(
+        {
+            "request": request,
+            "page": "dashboard",
+            "filters": {
+                "search": search,
+                "type": ioc_type,
+                "risk": risk,
+                "status": status,
+            },
+            "ioc_types": ["All", *IOC_TYPES],
+            "risk_options": ["All", "HIGH", "MEDIUM", "LOW"],
+            "status_options": ["All", *STATUS_OPTIONS],
+        }
+    )
+    return templates.TemplateResponse(request, "dashboard.html", context)
 
-    record = ioc.dict()
-    record["threat_score"] = score
 
-    ioc_database.append(record)
-
-    return {
-        "status": "IOC stored successfully",
-        "threat_score": score,
-        "total_iocs": len(ioc_database)
-    }
-
-
-# -------- View all IOCs --------
-@app.get("/iocs")
-def get_iocs():
-    return ioc_database
-
-
-# -------- Dashboard Summary --------
-@app.get("/dashboard-summary")
-def dashboard_summary():
-    total_iocs = len(ioc_database)
-
-    high_risk = [
-        ioc for ioc in ioc_database
-        if ioc.get("threat_score", 0) >= 75
-    ]
-    high_risk_count = len(high_risk)
-
-    avg_score = (
-        sum(ioc.get("threat_score", 0) for ioc in ioc_database) / total_iocs
-        if total_iocs > 0 else 0
+@app.get("/add", response_class=HTMLResponse)
+def add_ioc_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "add_ioc.html",
+        {
+            "request": request,
+            "page": "add",
+            "ioc_types": IOC_TYPES,
+            "status_options": STATUS_OPTIONS,
+        },
     )
 
+
+@app.post("/add")
+def add_ioc(
+    ioc: str = Form(...),
+    ioc_type: str = Form("Auto Detect"),
+    status: str = Form("Open"),
+    source: str = Form("Manual Upload"),
+):
+    add_threat(ioc=ioc, selected_type=ioc_type, status=status, source=source)
+    return RedirectResponse("/dashboard", status_code=302)
+
+
+@app.get("/feed", response_class=HTMLResponse)
+def feed_page(request: Request):
+    context = get_feed_context()
+    context.update(
+        {
+            "request": request,
+            "page": "feed",
+            "ioc_types": IOC_TYPES,
+        }
+    )
+    return templates.TemplateResponse(request, "feed.html", context)
+
+
+@app.post("/feed")
+def add_feed_ioc(
+    ioc: str = Form(...),
+    source: str = Form("Threat Feed"),
+):
+    add_threat(ioc=ioc, selected_type="Auto Detect", status="Open", source=source)
+    return RedirectResponse("/feed", status_code=302)
+
+
+@app.post("/feed/auto")
+def auto_feed(count: int = Form(8)):
+    generate_auto_feed(count)
+    return RedirectResponse("/feed", status_code=302)
+
+
+@app.get("/alerts", response_class=HTMLResponse)
+def alerts_page(
+    request: Request,
+    status: str = Query("All"),
+):
+    alerts = get_high_risk_alerts(status=status)
+    return templates.TemplateResponse(
+        request,
+        "alerts.html",
+        {
+            "request": request,
+            "page": "alerts",
+            "alerts": alerts,
+            "status_filter": status,
+            "status_options": ["All", *STATUS_OPTIONS],
+            "open_count": len([alert for alert in alerts if alert["status"] == "Open"]),
+            "critical_count": len([alert for alert in alerts if alert["score"] >= 85]),
+        },
+    )
+
+
+@app.get("/reports", response_class=HTMLResponse)
+def reports_page(request: Request):
+    context = get_reports_context()
+    context.update(
+        {
+            "request": request,
+            "page": "reports",
+        }
+    )
+    return templates.TemplateResponse(request, "reports.html", context)
+
+
+@app.get("/threats/{threat_id}", response_class=HTMLResponse)
+def threat_detail_page(request: Request, threat_id: int):
+    threat = get_threat_by_id(threat_id)
+    if threat is None:
+        raise HTTPException(status_code=404, detail="Threat not found")
+
+    return templates.TemplateResponse(
+        request,
+        "threat_detail.html",
+        {
+            "request": request,
+            "page": "alerts",
+            "threat": threat,
+            "related_threats": threat["related"],
+            "status_options": STATUS_OPTIONS,
+        },
+    )
+
+
+@app.post("/threats/{threat_id}/status")
+def change_status(threat_id: int, status: str = Form(...), redirect_to: str = Form("/dashboard")):
+    update_threat_status(threat_id, status)
+    return RedirectResponse(redirect_to, status_code=302)
+
+
+@app.get("/threats")
+def threats_data(
+    search: str = Query(""),
+    ioc_type: str = Query("All", alias="type"),
+    risk: str = Query("All"),
+    status: str = Query("All"),
+):
     return {
-        "total_iocs": total_iocs,
-        "high_risk_iocs": high_risk_count,
-        "average_threat_score": round(avg_score, 2)
+        "threats": get_filtered_threats(
+            search=search,
+            ioc_type=ioc_type,
+            risk=risk,
+            status=status,
+        )
     }
-    
